@@ -1,5 +1,4 @@
 import asyncio
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.enums import ChatAction
 from aiogram.types import LinkPreviewOptions
 from modules.utils import safe_edit_text
@@ -19,6 +18,9 @@ def format_download_text(percentage: float, animation: str) -> str:
     else:
         return f"⬇️ <u>{word[:underline_len]}</u>{word[underline_len:]}{animation}"
 
+# ------------------------------------------------------------------------------
+# Countdown messages
+# ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
 # Countdown messages
 # ------------------------------------------------------------------------------
@@ -126,29 +128,18 @@ async def animate_starting(progress_msg, original_url: str, bot, is_playlist: bo
 # ------------------------------------------------------------------------------
 # Download progress animation itself
 # ------------------------------------------------------------------------------
-async def animate_download_progress(
-    progress_msg,
-    original_url: str,
-    video_id: str,
-    bot,
-    download_progress: dict,
-    is_playlist: bool = False,
-):
-    """Continuously update download progress with animation.
-    Now reduces update frequency for playlists and handles flood control errors.
-    """
+async def animate_download_progress(progress_msg, original_url: str, video_id: str, bot, download_progress: dict):
+    """Continuously update download progress with animation."""
     animations = [".", "..", "..."]
     i = -1
     last_switch = 0.0
+    update_interval = 0.5
     ellipsis_interval = 1.0
-    update_interval = 1.0 if is_playlist else 0.5  # slower for playlists
     next_update = asyncio.get_event_loop().time()
 
     try:
         while True:
-            await bot.send_chat_action(
-                chat_id=progress_msg.chat.id, action="record_video"
-            )
+            await bot.send_chat_action(chat_id=progress_msg.chat.id, action=ChatAction.RECORD_VIDEO)
 
             now = asyncio.get_event_loop().time()
             if now - last_switch >= ellipsis_interval:
@@ -156,32 +147,18 @@ async def animate_download_progress(
                 last_switch = now
 
             percentage = download_progress.get(video_id, 0.0)
-            text = (
-                f"<blockquote>{original_url}</blockquote>\n"
-                f"{format_download_text(percentage, animations[i])}"
-            )
+            text = f"<blockquote>{original_url}</blockquote>\n" \
+                   f"{format_download_text(percentage, animations[i])}"
 
-            try:
-                await safe_edit_text(
-                    progress_msg,
-                    text,
-                    link_preview_options=None,
-                    parse_mode="HTML",
-                )
-            except TelegramBadRequest as e:
-                if "Too Many Requests" in str(e):
-                    # Just skip one cycle instead of crashing
-                    await asyncio.sleep(3)
-                    continue
-                elif "message is not modified" in str(e):
-                    continue
-                else:
-                    raise
+            await safe_edit_text(
+                progress_msg,
+                text,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+                parse_mode="HTML",
+            )
 
             next_update += update_interval
-            await asyncio.sleep(
-                max(0.0, next_update - asyncio.get_event_loop().time())
-            )
+            await asyncio.sleep(max(0.0, next_update - asyncio.get_event_loop().time()))
     except asyncio.CancelledError:
         pass
     except Exception:

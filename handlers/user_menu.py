@@ -148,11 +148,7 @@ async def process_single_video(
         parse_mode="HTML",
     )
 
-    anim_task = asyncio.create_task(
-        animate_download_progress(
-            progress_msg, original_url, vid_id, bot, download_progress, is_playlist=("list=" in original_url)
-        )
-    )
+    anim_task = asyncio.create_task(animate_download_progress(progress_msg, original_url, vid_id, bot, download_progress))
     track_task(user_id, anim_task)
 
     try:
@@ -189,9 +185,6 @@ async def process_single_video(
 
         await bot.send_chat_action(chat_id=msg.chat.id, action=ChatAction.UPLOAD_VOICE)
         await send_processed_audio(bot, msg, vid_id, final_path, title, artist, thumb_data)
-
-        if not anim_task.done():
-            anim_task.cancel()
 
     except asyncio.CancelledError:
         anim_task.cancel()
