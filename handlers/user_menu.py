@@ -184,6 +184,19 @@ async def process_single_video(
     temp_path, final_path = build_paths(vid_id, title)
     download_progress[vid_id] = 0.0
 
+    filesize = info.get("filesize") or info.get("filesize_approx") or 0
+    # Telegram limit 50 MB, add small margin
+    if filesize > 48 * 1024 * 1024:
+        await safe_edit_text(
+            progress_msg,
+            f"{display_name}\n⛔️ файл слишком большой для телеграма <i>({round(filesize / 1024 / 1024, 1)} MB)</i>",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            parse_mode="HTML"
+        )
+        await asyncio.sleep(7)
+        await progress_msg.delete()
+        return
+
     # Update with display name
     await safe_edit_text(
         progress_msg,
@@ -275,28 +288,6 @@ async def process_single_video(
 # ------------------------------------------------------------------------------
 # Entry point for URLs
 # ------------------------------------------------------------------------------
-async def send_processed_audio(
-        bot: Bot,
-        msg: Message,
-        vid_id: str,
-        audio_path: str,
-        title: str,
-        artist: str,
-        thumb_data: bytes,
-        silent: bool = False  # New parameter
-) -> str:
-    sent = await bot.send_audio(
-        chat_id=msg.chat.id,
-        audio=FSInputFile(audio_path),
-        title=title,
-        performer=artist,
-        thumbnail=BufferedInputFile(thumb_data, filename=f"{vid_id}_thumb.jpg"),
-        disable_notification=silent,
-    )
-    db.add_data(vid_id, sent.audio.file_id)
-    return sent.audio.file_id
-
-
 # Update handle_url:
 async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
     is_playlist = "list=" in original_url or "/playlist" in original_url
