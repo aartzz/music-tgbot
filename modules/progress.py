@@ -132,7 +132,7 @@ async def animate_download_progress(progress_msg, display_name: str, video_id: s
     animations = [".", "..", "..."]
     i = -1
     last_switch = 0.0
-    update_interval = 0.5 if not is_playlist else 1.0
+    update_interval = 0.5 if not is_playlist else 0.5
     ellipsis_interval = 1.0
     next_update = asyncio.get_event_loop().time()
 
