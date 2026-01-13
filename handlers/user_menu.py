@@ -151,7 +151,7 @@ async def process_single_video(
     thumb_url = info.get("thumbnail")
 
     # Format display name with link
-    display_name = f'<a href="{original_url}">{title}</a>'
+    display_name = f'<blockquote><a href="{original_url}">{title}</a></blockquote>'
 
     # Check cache first if not skipped
     if not skip_db_check:
@@ -346,8 +346,8 @@ async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
                 return
 
             # Get playlist name and create display link
-            playlist_title = info.get("title", "Playlist")
-            playlist_display = f'<a href="{original_url}">{playlist_title}</a>'
+            playlist_title = info.get("title", "??????")
+            playlist_display = f'<blockquote><a href="{original_url}">{playlist_title}</a></blockquote>'
 
             total = len(entries)
             await safe_edit_text(
@@ -385,7 +385,7 @@ async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
                         db.remove_data(vid_id)
 
                 video_title = entry.get("title", "<unknown>")
-                video_display = f'<a href="{entry["webpage_url"]}">{video_title}</a>'
+                video_display = f'<blockquote><a href="{entry["webpage_url"]}">{video_title}</a></blockquote>'
 
                 video_msg = await msg.answer(
                     f"{video_display}\n⬇️ скачивание...",
@@ -413,7 +413,7 @@ async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
         else:
             # Single video - get title and update display
             video_title = info.get("title", "<unknown>")
-            video_display = f'<a href="{original_url}">{video_title}</a>'
+            video_display = f'<blockquote><a href="{original_url}">{video_title}</a></blockquote>'
 
             await safe_edit_text(
                 progress_msg,
