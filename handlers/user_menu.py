@@ -347,7 +347,7 @@ async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
 
             # Get playlist name and create display link
             playlist_title = info.get("title", "??????")
-            playlist_display = f'<blockquote><a href="{original_url}">{playlist_title}</a></blockquote>'
+            playlist_display = f'<blockquote><b><a href="{original_url}">{playlist_title}</a></b></blockquote>'
 
             total = len(entries)
             await safe_edit_text(
