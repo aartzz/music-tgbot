@@ -186,13 +186,26 @@ async def process_single_video(
         await bot.send_chat_action(chat_id=msg.chat.id, action=ChatAction.UPLOAD_VOICE)
         await send_processed_audio(bot, msg, vid_id, final_path, title, artist, thumb_data)
 
-    except asyncio.CancelledError:
         anim_task.cancel()
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
+
+    except asyncio.CancelledError:
+        try:
+            anim_task.cancel()
+        except Exception:
+            pass
         cleanup_file(temp_path)
         cleanup_file(final_path)
         raise
+
     except Exception as e:
-        anim_task.cancel()
+        try:
+            anim_task.cancel()
+        except Exception:
+            pass
         err_txt = f"⛔️ ошибка обработки\n{e}"
         try:
             await progress_msg.edit_text(

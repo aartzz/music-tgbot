@@ -1,5 +1,6 @@
 import asyncio
 from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import LinkPreviewOptions
 from modules.utils import safe_edit_text
 
@@ -82,12 +83,18 @@ async def animate_ellipsis(progress_msg, original_url: str, prefix: str, suffix:
             await bot.send_chat_action(chat_id=progress_msg.chat.id, action=action)
             dots = animations[count % len(animations)]
             text = f"<blockquote>{original_url}</blockquote>\n{prefix}{dots}{suffix}"
-            await safe_edit_text(
-                progress_msg,
-                text,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                parse_mode="HTML",
-            )
+            try:
+                await safe_edit_text(
+                    progress_msg,
+                    text,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    parse_mode="HTML",
+                )
+            except TelegramBadRequest as e:
+                if "too many requests" in str(e).lower() or "retry after" in str(e).lower():
+                    pass
+                else:
+                    raise
             count += 1
             await asyncio.sleep(1)
         except Exception:
@@ -128,12 +135,12 @@ async def animate_starting(progress_msg, original_url: str, bot, is_playlist: bo
 # ------------------------------------------------------------------------------
 # Download progress animation itself
 # ------------------------------------------------------------------------------
-async def animate_download_progress(progress_msg, original_url: str, video_id: str, bot, download_progress: dict):
+async def animate_download_progress(progress_msg, original_url: str, video_id: str, bot, download_progress: dict, is_playlist: bool = False):
     """Continuously update download progress with animation."""
     animations = [".", "..", "..."]
     i = -1
     last_switch = 0.0
-    update_interval = 0.5
+    update_interval = 0.5 if not is_playlist else 1
     ellipsis_interval = 1.0
     next_update = asyncio.get_event_loop().time()
 
@@ -150,12 +157,18 @@ async def animate_download_progress(progress_msg, original_url: str, video_id: s
             text = f"<blockquote>{original_url}</blockquote>\n" \
                    f"{format_download_text(percentage, animations[i])}"
 
-            await safe_edit_text(
-                progress_msg,
-                text,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                parse_mode="HTML",
-            )
+            try:
+                await safe_edit_text(
+                    progress_msg,
+                    text,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    parse_mode="HTML",
+                )
+            except TelegramBadRequest as e:
+                if "too many requests" in str(e).lower() or "retry after" in str(e).lower():
+                    pass  # Let animation freeze, continue after
+                else:
+                    raise
 
             next_update += update_interval
             await asyncio.sleep(max(0.0, next_update - asyncio.get_event_loop().time()))
