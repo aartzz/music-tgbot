@@ -357,6 +357,15 @@ async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
                 parse_mode="HTML",
             )
 
+            try:
+                await bot.pin_chat_message(
+                    chat_id=msg.chat.id,
+                    message_id=progress_msg.message_id,
+                    disable_notification=True  # This prevents the "pinned message" service message
+                )
+            except Exception:
+                pass
+
             for idx, entry in enumerate(entries, start=1):
                 if asyncio.current_task().cancelled():
                     raise asyncio.CancelledError()
