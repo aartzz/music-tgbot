@@ -4,9 +4,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import LinkPreviewOptions
 from modules.utils import safe_edit_text
 
-# ------------------------------------------------------------------------------
-# Download progress formatting
-# ------------------------------------------------------------------------------
+
 def format_download_text(percentage: float, animation: str) -> str:
     """Format download text with underlined progress"""
     word = "скачивание"
@@ -19,14 +17,13 @@ def format_download_text(percentage: float, animation: str) -> str:
     else:
         return f"⬇️ <u>{word[:underline_len]}</u>{word[underline_len:]}{animation}"
 
-# ------------------------------------------------------------------------------
-# Countdown messages
-# ------------------------------------------------------------------------------
+
+
 async def animate_countdown(
     message,
     info: str,
     seconds: int = 15,
-    original_url: str | None = None,
+    display_name: str | None = None,
     error_details: str | None = None,
 ):
     """
@@ -39,8 +36,8 @@ async def animate_countdown(
     for i in range(seconds - 1, 0, -1):
         try:
             # Build the visible message body
-            if original_url:
-                text = f"<blockquote>{original_url}</blockquote>\n"
+            if display_name:
+                text = f"{display_name}\n"
 
                 # Add main info and countdown on same line
                 text += f"{info} <i>{i}</i>"
@@ -68,17 +65,15 @@ async def animate_countdown(
     except Exception:
         pass
 
-# ------------------------------------------------------------------------------
-# Simple ellipsis animation (e.g. for 'обработка...', 'отправка...')
-# ------------------------------------------------------------------------------
-async def animate_ellipsis(progress_msg, original_url: str, prefix: str, suffix: str, bot, action: ChatAction):
+
+async def animate_ellipsis(progress_msg, display_name: str, prefix: str, suffix: str, bot, action: ChatAction):
     """Animated ellipsis ('...', '..', etc.) for processing/sending states."""
     animations = [".", "..", "..."]
     count = 1
     while True:
         try:
             dots = animations[count % len(animations)]
-            text = f"<blockquote>{original_url}</blockquote>\n{prefix}{dots}{suffix}"
+            text = f"{display_name}\n{prefix}{dots}{suffix}"
             try:
                 await safe_edit_text(
                     progress_msg,
@@ -96,9 +91,7 @@ async def animate_ellipsis(progress_msg, original_url: str, prefix: str, suffix:
         except Exception:
             break
 
-# ------------------------------------------------------------------------------
-# Starting animation (fetching video/playlist info)
-# ------------------------------------------------------------------------------
+
 async def animate_starting(progress_msg, original_url: str, bot, is_playlist: bool = False):
     """Display 'fetching video/playlist' animation."""
     animations = [".", "..", "..."]
@@ -133,10 +126,8 @@ async def animate_starting(progress_msg, original_url: str, bot, is_playlist: bo
         except Exception:
             break
 
-# ------------------------------------------------------------------------------
-# Download progress animation itself
-# ------------------------------------------------------------------------------
-async def animate_download_progress(progress_msg, original_url: str, video_id: str, bot, download_progress: dict, is_playlist: bool = False):
+
+async def animate_download_progress(progress_msg, display_name: str, video_id: str, bot, download_progress: dict, is_playlist: bool = False):
     """Continuously update download progress with animation."""
     animations = [".", "..", "..."]
     i = -1
@@ -153,8 +144,7 @@ async def animate_download_progress(progress_msg, original_url: str, video_id: s
                 last_switch = now
 
             percentage = download_progress.get(video_id, 0.0)
-            text = f"<blockquote>{original_url}</blockquote>\n" \
-                   f"{format_download_text(percentage, animations[i])}"
+            text = f"{display_name}\n{format_download_text(percentage, animations[i])}"
 
             try:
                 await safe_edit_text(
@@ -165,7 +155,7 @@ async def animate_download_progress(progress_msg, original_url: str, video_id: s
                 )
             except TelegramBadRequest as e:
                 if "too many requests" in str(e).lower() or "retry after" in str(e).lower() or "flood control" in str(e).lower():
-                    pass  # Let animation freeze, continue after
+                    pass
                 else:
                     raise
 
