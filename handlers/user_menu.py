@@ -1,276 +1,322 @@
 import asyncio
 import os
 import re
-from io import BytesIO
-import aiohttp
-import concurrent.futures
-import unicodedata
+from typing import Optional, Dict, List, Any
 
 from aiogram import Router, Bot, F
 from aiogram.enums import ChatAction, ChatType
 from aiogram.filters import Command
 from aiogram.types import Message, FSInputFile, BufferedInputFile, LinkPreviewOptions
-from PIL import Image
-from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, APIC, TIT2, TPE1
-from yt_dlp import YoutubeDL
+from aiogram.exceptions import TelegramBadRequest
+
 from db.db import Music, Analytics
-# Add this near the top of your file, after imports
-import logging
+from modules.downloader import (
+    yt_extract,
+    make_ydl_opts,
+    build_paths,
+    rename_with_collision_avoidance,
+)
+from modules.processing import process_audio, cleanup_file
+from modules.utils import safe_edit_text, remove_duplicate_artists
+from modules.progress import animate_ellipsis, animate_download_progress, animate_countdown, animate_starting, format_download_text
 
-# Configure yt-dlp logger to suppress HTTP 403 errors for cached content
-yt_dlp_logger = logging.getLogger('yt_dlp')
-yt_dlp_logger.setLevel(logging.ERROR)
-
-
-class YtDlpFilter(logging.Filter):
-    def filter(self, record):
-        # Suppress HTTP 403 errors that are just informational
-        if 'HTTP Error 403: Forbidden' in record.getMessage():
-            return False
-        return True
-
-
-yt_dlp_logger.addFilter(YtDlpFilter())
-
+# ------------------------------------------------------------------------------
+# Router & Database
+# ------------------------------------------------------------------------------
 router = Router()
 
 DOWNLOAD_DIR = "downloads"
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Initialize database
 db = Music()
 db_analytics = Analytics()
 
-# Create a thread pool for CPU-bound tasks
-thread_pool = concurrent.futures.ThreadPoolExecutor()
+# Track per-user running tasks and messages
+user_tasks: Dict[int, List[asyncio.Task]] = {}
+user_messages: Dict[int, List[Message]] = {}
 
-# Create a semaphore to limit concurrent downloads
+# Global concurrent limit
 MAX_CONCURRENT_DOWNLOADS = 5
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# Track active tasks per user
-user_tasks = {}  # {user_id: [task1, task2, ...]}
-user_messages = {}
+# Single dictionary for progress tracking
+download_progress: Dict[str, float] = {}
+
+YOUTUBE_REGEX = (
+    r"(?:https?://)?(?:www\.)?(?:m\.)?"
+    r"(?:youtube\.com|youtu\.be)/(?:watch\?v=|embed/|v/|playlist\?list=|)"
+    r"([\w-]{11}|list=[\w-]{34})(?:\S+)?"
+)
+
+# ------------------------------------------------------------------------------
+# Task tracking
+# ------------------------------------------------------------------------------
+def track_task(uid: int, task: asyncio.Task):
+    user_tasks.setdefault(uid, []).append(task)
 
 
-async def run_in_threadpool(func, *args, **kwargs):
-    """Run a synchronous function in a thread pool."""
-    return await asyncio.get_event_loop().run_in_executor(
-        thread_pool, lambda: func(*args, **kwargs)
-    )
+def untrack_task(uid: int, task: asyncio.Task):
+    try:
+        user_tasks[uid].remove(task)
+    except Exception:
+        pass
 
 
-async def download_video(url, ydl_opts):
-    """Download a video using yt-dlp in a separate thread."""
-    with YoutubeDL(ydl_opts) as ydl:
-        return await run_in_threadpool(ydl.extract_info, url, download=True)
+def track_message(uid: int, message: Message):
+    user_messages.setdefault(uid, []).append(message)
 
 
-def _remove_duplicate_artists(artist_string: str) -> str:
-    """
-    Cleans an artist string by removing duplicate artist names.
-    Handles various delimiters like ',', ' and ', ' & '.
-    """
-    if not artist_string:
-        return ""
-    # Normalize delimiters: replace ' and ' and ' & ' with ','
-    normalized_string = artist_string.replace(' and ', ', ').replace(' & ', ', ')
+async def cancel_user_tasks_and_messages(uid: int):
+    for t in user_tasks.get(uid, []):
+        if not t.done() and not t.cancelled():
+            t.cancel()
 
-    # Split by comma, trim whitespace, and convert to lowercase for case-insensitive comparison
-    artists = [a.strip() for a in normalized_string.split(', ') if a.strip()]
-    if not artists:
-        return ""
-
-    # Use a set to keep track of seen artists to ensure uniqueness
-    seen = set()
-    unique_artists = []
-
-    for artist_name in artists:
-        if artist_name not in seen:
-            unique_artists.append(artist_name)
-            seen.add(artist_name)
-
-    # Reconstruct the string with unique, properly capitalized artists
-    return ", ".join(unique_artists)
-
-
-def sanitize_filename(filename: str) -> str:
-    """
-    Sanitizes a string to be used as a filename.
-    Removes invalid characters and truncates to a reasonable length.
-    """
-    # Normalize Unicode characters to their closest ASCII equivalents
-    filename = unicodedata.normalize('NFKD', filename).encode('ascii', 'ignore').decode('utf-8')
-    # Remove invalid characters
-    filename = re.sub(r'[\\/:*?"<>|]', "", filename)
-    # Replace spaces with underscores or hyphens (optional, but good practice)
-    filename = filename.replace(" ", "_")
-    # Truncate to a reasonable length to avoid filesystem issues
-    max_length = 100
-    if len(filename) > max_length:
-        filename = filename[:max_length]
-    return filename
-
-
-async def process_audio(audio_filepath, title, artist, thumbnail_url):
-    """Process the audio file with metadata and thumbnail."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(thumbnail_url) as response:
-            thumbnail_data = await response.read()
-
-    # Process image in threadpool (CPU-bound)
-    def process_image_and_audio():
-        img = Image.open(BytesIO(thumbnail_data))
-        if img.mode == "RGBA":
-            img = img.convert("RGB")
-
-        # Crop to centered square
-        width, height = img.size
-        min_dimension = min(width, height)
-
-        # Calculate crop coordinates for centered square
-        left = (width - min_dimension) // 2
-        top = (height - min_dimension) // 2
-        right = left + min_dimension
-        bottom = top + min_dimension
-
-        # Crop to square
-        img = img.crop((left, top, right, bottom))
-
-        # Further crop the square to make it smaller
-        original_square_dim = img.size[0]  # Assuming it's already a square
-        target_square_dim = int(original_square_dim * (346 / 461))
-
-        # Calculate crop coordinates for the new smaller centered square
-        new_left = (original_square_dim - target_square_dim) // 2
-        new_top = (original_square_dim - target_square_dim) // 2
-        new_right = new_left + target_square_dim
-        new_bottom = new_top + target_square_dim
-
-        img = img.crop((new_left, new_top, new_right, new_bottom))
-
-        thumbnail_bytes = BytesIO()
-        img.save(thumbnail_bytes, format="PNG")
-        thumbnail_bytes.seek(0)
-
-        audio = MP3(audio_filepath, ID3=ID3)
-        if audio.tags is None:
-            audio.add_tags()
-
-        # Clear existing APIC tags to avoid duplicates
-        if 'APIC:' in audio.tags:
-            del audio.tags['APIC:']
-
-        audio.tags.add(
-            APIC(
-                encoding=3,  # UTF-8
-                mime="image/PNG",
-                type=3,  # 3 is for Front Cover
-                desc="Cover",
-                data=thumbnail_bytes.getvalue(),
-            )
-        )
-        audio.tags.add(TIT2(encoding=3, text=title))  # Title
-        cleaned_artist = _remove_duplicate_artists(artist)
-        audio.tags.add(TPE1(encoding=3, text=cleaned_artist))  # Artist
-        audio.save()
-
-        return thumbnail_bytes.getvalue()
-
-    return await run_in_threadpool(process_image_and_audio)
-
-
-async def animate_starting_progress(progress_msg, original_url, bot):
-    """Animate the progress message with ellipsis and show playlist warning if needed."""
-    animations = [".", "..", "..."]
-    count = 0
-
-    while True:
+    for m in user_messages.get(uid, []):
         try:
-            animation = animations[count % len(animations)]
-            await bot.send_chat_action(chat_id=progress_msg.chat.id, action=ChatAction.CHOOSE_STICKER)
-            message = f"<blockquote>{original_url}</blockquote>\n🛜 подготовка к скачиванию{animation}"
-
-            if count >= 15:
-                message = f"<blockquote>{original_url}</blockquote>\n⏳ плейлисты обрабатываются дольше, терпи\n<i>[прошло {count} сек.] -- /cancel чтобы отменить</i>"
-
-            await progress_msg.edit_text(
-                message,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                parse_mode="HTML"
-            )
-            count += 1
-            await asyncio.sleep(1)
+            await m.delete()
         except Exception:
-            # Message might have been deleted or edited elsewhere
-            break
+            pass
 
+    user_tasks[uid] = []
+    user_messages[uid] = []
 
-async def animate_progress(progress_msg, original_url, text,
-                           text_after_ellipsis, bot, chat_action: ChatAction):
-    """Animate the progress message with ellipsis and show playlist warning if needed."""
-    animations = [".", "..", "..."]
-    count = 0
-
-    while True:
-        try:
-            animation = animations[count % len(animations)]
-            message = f"<blockquote>{original_url}</blockquote>\n{text}{animation}{text_after_ellipsis}"
-
-            await bot.send_chat_action(chat_id=progress_msg.chat.id, action=chat_action)
-            await progress_msg.edit_text(
-                message,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                parse_mode="HTML"
-            )
-            count += 1
-            await asyncio.sleep(1)
-        except Exception:
-            # Message might have been deleted or edited elsewhere
-            break
-
-
-async def send_cached_audio(msg, bot, video_id, file_id, progress_msg):
-    """Send cached audio using existing file_id."""
+# ------------------------------------------------------------------------------
+# Core file sending
+# ------------------------------------------------------------------------------
+async def send_cached_audio(msg: Message, bot: Bot, vid_id: str, file_id: str, progress_msg: Message) -> bool:
     try:
         await progress_msg.delete()
-        await bot.send_audio(
-            chat_id=msg.chat.id,
-            audio=file_id,
-            disable_notification=True,
-        )
+    except Exception:
+        pass
+    try:
+        await bot.send_audio(chat_id=msg.chat.id, audio=file_id, disable_notification=True)
         return True
-    except Exception as e:
-        print(f"Error sending cached audio for {video_id}: {e}")
-        # File might be deleted from Telegram, remove from database
-        db.remove_data(video_id)
+    except Exception:
+        db.remove_data(vid_id)
         return False
 
 
+async def send_processed_audio(
+    bot: Bot,
+    msg: Message,
+    vid_id: str,
+    audio_path: str,
+    title: str,
+    artist: str,
+    thumb_data: bytes,
+) -> str:
+    sent = await bot.send_audio(
+        chat_id=msg.chat.id,
+        audio=FSInputFile(audio_path),
+        title=title,
+        performer=artist,
+        thumbnail=BufferedInputFile(thumb_data, filename=f"{vid_id}_thumb.jpg"),
+        disable_notification=True,
+    )
+    db.add_data(vid_id, sent.audio.file_id)
+    return sent.audio.file_id
+
+# ------------------------------------------------------------------------------
+# Video processing pipeline
+# ------------------------------------------------------------------------------
+async def process_single_video(
+    msg: Message,
+    bot: Bot,
+    original_url: str,
+    info: Dict[str, Any],
+    progress_msg: Message,
+    user_id: int
+):
+    vid_id = info.get("id")
+    title = info.get("title", "<unknown>")
+    artist = remove_duplicate_artists(info.get("artist", info.get("uploader", "<unknown>")))
+    thumb_url = info.get("thumbnail")
+
+    cached_id = db.get_file_id(vid_id)
+    if cached_id:
+        sent = await send_cached_audio(msg, bot, vid_id, cached_id, progress_msg)
+        if sent:
+            return
+
+    temp_path, final_path = build_paths(vid_id, title)
+    download_progress[vid_id] = 0.0
+
+    await safe_edit_text(
+        progress_msg,
+        f"<blockquote>{original_url}</blockquote>\n⬇️ скачивание...",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        parse_mode="HTML",
+    )
+
+    anim_task = asyncio.create_task(animate_download_progress(progress_msg, original_url, vid_id, bot, download_progress))
+    track_task(user_id, anim_task)
+
+    try:
+        ydl_opts = make_ydl_opts(vid_id, download_progress)
+        await yt_extract(info.get("webpage_url", original_url), ydl_opts, download=True)
+
+        if not (os.path.exists(temp_path) and thumb_url):
+            raise RuntimeError(f"404 - видео '{title}' не существует")
+
+        try:
+            final_path = rename_with_collision_avoidance(temp_path, final_path)
+        except Exception:
+            final_path = temp_path
+
+        anim_task.cancel()
+        await progress_msg.edit_text(
+            f"<blockquote>{original_url}</blockquote>\n✴️ обработка...",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            parse_mode="HTML",
+        )
+        anim_task = asyncio.create_task(animate_ellipsis(progress_msg, original_url, "✴️ обработка", "", bot, ChatAction.UPLOAD_PHOTO))
+        track_task(user_id, anim_task)
+
+        thumb_data = await process_audio(final_path, title, artist, thumb_url)
+
+        anim_task.cancel()
+        await progress_msg.edit_text(
+            f"<blockquote>{original_url}</blockquote>\n❇️ отправка...",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            parse_mode="HTML",
+        )
+        anim_task = asyncio.create_task(animate_ellipsis(progress_msg, original_url, "❇️ отправка", "", bot, ChatAction.UPLOAD_VOICE))
+        track_task(user_id, anim_task)
+
+        await bot.send_chat_action(chat_id=msg.chat.id, action=ChatAction.UPLOAD_VOICE)
+        await send_processed_audio(bot, msg, vid_id, final_path, title, artist, thumb_data)
+
+    except asyncio.CancelledError:
+        anim_task.cancel()
+        cleanup_file(temp_path)
+        cleanup_file(final_path)
+        raise
+    except Exception as e:
+        anim_task.cancel()
+        err_txt = f"⛔️ ошибка обработки\n{e}"
+        try:
+            await progress_msg.edit_text(
+                f"<blockquote>{original_url}</blockquote>\n{err_txt} <i>15</i>\n```\n{e}```",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+                parse_mode="HTML",
+            )
+        except Exception:
+            progress_msg = await msg.answer(
+                f"<blockquote>{original_url}</blockquote>\n{err_txt} <i>15</i>\n```\n{e}```",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+                parse_mode="HTML",
+            )
+            track_message(user_id, progress_msg)
+        await animate_countdown(progress_msg, err_txt, 15, original_url, str(e))
+    finally:
+        download_progress.pop(vid_id, None)
+        cleanup_file(temp_path)
+        cleanup_file(final_path)
+        try:
+            anim_task.cancel()
+        except Exception:
+            pass
+
+# ------------------------------------------------------------------------------
+# Entry point for URLs
+# ------------------------------------------------------------------------------
+async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
+    is_playlist = "list=" in original_url or "/playlist" in original_url
+    progress_msg = await msg.answer(
+        f"<blockquote>{original_url}</blockquote>\n🛜 достаю {'плейлист' if is_playlist else 'видео'}...",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        parse_mode="HTML",
+    )
+    track_message(user_id, progress_msg)
+
+    db_analytics.add_user(msg.from_user.id)
+    db_analytics.increment_use_count()
+
+    start_anim = asyncio.create_task(animate_starting(progress_msg, original_url, bot, is_playlist))
+    track_task(user_id, start_anim)
+
+    async with download_semaphore:
+        try:
+            info = await yt_extract(original_url, make_ydl_opts(), download=False)
+        except Exception:
+            start_anim.cancel()
+            err_txt = "⛔️ не удалось получить информацию о видео"
+            await animate_countdown(progress_msg, err_txt, 15, original_url)
+            return
+
+        start_anim.cancel()
+
+        # Playlist
+        if info.get("_type") == "playlist":
+            entries = info.get("entries", []) or []
+            if not entries:
+                await animate_countdown(progress_msg, "⛔️ плейлист пуст", 15, original_url)
+                return
+
+            total = len(entries)
+            await safe_edit_text(
+                progress_msg,
+                f"<blockquote>{original_url}</blockquote>\n📋 скачиваем плейлист <i>(0/{total})</i>",
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+                parse_mode="HTML",
+            )
+
+            for idx, entry in enumerate(entries, start=1):
+                if asyncio.current_task().cancelled():
+                    raise asyncio.CancelledError()
+                if not entry or not entry.get("webpage_url"):
+                    continue
+
+                await safe_edit_text(
+                    progress_msg,
+                    f"<blockquote>{original_url}</blockquote>\n📋 скачиваем плейлист <i>({idx}/{total} - отменить /cancel)</i>",
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    parse_mode="HTML",
+                )
+
+                video_msg = await msg.answer(
+                    f"<blockquote>{entry['webpage_url']}</blockquote>\n⬇️ скачивание...",
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    parse_mode="HTML",
+                )
+                track_message(user_id, video_msg)
+                await process_single_video(msg, bot, entry["webpage_url"], entry, video_msg, user_id)
+
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+            done = await msg.answer("✅ готово, плейлист полностью скачан <i>15</i>", parse_mode="HTML")
+            await animate_countdown(done, "✅ готово, плейлист полностью скачан", 15)
+
+        else:
+            await process_single_video(msg, bot, original_url, info, progress_msg, user_id)
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+
+# ------------------------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------------------------
 @router.message(Command(commands=["start"]))
 async def start(msg: Message):
     await msg.answer(
         """<b><u>lostya's youtube music downloader</u></b>
 этот бот сделан специально для @lostyawolfer но ты им тоже можешь пользоваться
 
-короче смысл такой. я слушаю музыку через телеграм. и меня достало что я не могу просто без ничего лишнего взять и скачать нужные мне музыки.
-этот бот решает эту проблему.
-
 <b>РАБОТАЕТ ТОЛЬКО ЮТУБ!</b>
 
 <b><i>КАК ПОЛЬЗОВАТЬСЯ:</i></b>
-<blockquote>- отправляешь ссылку на ютуб видео или ютуб плейлист
-- бот всё сделает за тебя, скачав звук, добавив в него превьюшку, имя автора и название трека
-- можно отправлять несколько ссылок за раз, обработка асинхронна
-- если ты чёт перепутал всегда можно использовать команду /cancel чтобы отменить все текущие загрузки
-- каждое сообщение прогресса анимировано чтобы ты мог видеть что бот не умер а реально что-то делает
-- бот автоматом будет чистить чат от команд и подобного, чтобы держать твой "плейлист" в чистоте! :>
-- теперь бот кеширует файлы! повторные запросы одного видео будут мгновенными!</blockquote>
-
-бот почти полностью сделан через ии (gemini 2.5 flash, claude 3.7 sonnet) но я вложил немало усилий в то чтобы заставить эту хрень работать и всё соединить воедино ибо ии обычно немного тупой
-но разве это имеет значение? бот офигенен. пользуйся""", parse_mode='HTML')
+<blockquote>- скинь ссылку на видео или плейлист ютуб
+- бот скачаeт звук, добавит превью, исполнителя и название
+- можно отправлять несколько ссылок
+- /cancel отменяет все загрузки
+- сообщения прогресса анимированы
+- бот автоматически очищает командные сообщения
+- используется кеш, повторные загрузки мгновенны!</blockquote>""",
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command(commands=["analytics"]))
@@ -279,494 +325,49 @@ async def send_analytics(msg: Message):
         await msg.delete()
         return
     await msg.delete()
-    analytics_msg = await msg.answer(
-        f'бот использовался всего {db_analytics.get_total_use_count()} раз, {db_analytics.get_user_count()} уникальными пользователями')
+    a = await msg.answer(
+        f"бот скачал {db_analytics.get_total_use_count()} файлов по запросам от {db_analytics.get_user_count()} пользователей"
+    )
     await asyncio.sleep(5)
-    await analytics_msg.delete()
+    await a.delete()
 
 
 @router.message(Command(commands=["cancel"]))
 async def cancel_downloads(msg: Message):
-    user_id = msg.from_user.id
-
-    if user_id not in user_tasks or not user_tasks[user_id]:
-        cancel_msg = await msg.answer("✅ у тебя нечего отменять! :>")
-        # Delete the command message and the response after a delay
-        await asyncio.sleep(5)
-        await msg.delete()
-        await cancel_msg.delete()
-        return
-
-    # Cancel all tasks for this user
-    for task in user_tasks[user_id]:
-        if not task.done() and not task.cancelled():
-            task.cancel()
-
-    # Delete all progress messages
-    if user_id in user_messages:
-        for message in user_messages[user_id]:
-            try:
-                await message.delete()
-            except Exception:
-                pass
-        user_messages[user_id] = []
-
-    # Clear the tasks list
-    user_tasks[user_id] = []
-
-    cancel_msg = await msg.answer("✅ отменено! :>")
-    # Delete the command message and the response after a delay
-    await asyncio.sleep(3)
     await msg.delete()
-    await cancel_msg.delete()
+    user_id = msg.from_user.id
+    if not user_tasks.get(user_id):
+        m = await msg.answer("✅ нечего отменять <i>5</i>", parse_mode="HTML")
+        await animate_countdown(m, "✅ нечего отменять", 5)
+        return
+    await cancel_user_tasks_and_messages(user_id)
+    m = await msg.answer("✅ отменено! <i>5</i>", parse_mode="HTML")
+    await animate_countdown(m, "✅ отменено!", 5)
 
-
+# ------------------------------------------------------------------------------
+# Main handler
+# ------------------------------------------------------------------------------
 @router.message(F.chat.type.in_({ChatType.SUPERGROUP, ChatType.GROUP, ChatType.CHANNEL, ChatType.PRIVATE}))
 async def main(msg: Message, bot: Bot):
     if not msg.audio:
-        await msg.delete()
-    print(f"{msg.from_user.id} (@{msg.from_user.username}) requested {msg.text}")
-    text = msg.text
-    if not text:
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    if not msg.text:
         return
 
-    youtube_regex = (
-        r"(?:https?://)?(?:www\.)?(?:m\.)?(?:youtube\.com|youtu\.be)/(?:watch\?v=|embed/|v/|playlist\?list=|)([\w-]{11}|list=[\w-]{34})(?:\S+)?"
-    )
-    match = re.search(youtube_regex, text)
+    print(f"{msg.from_user.id} (@{msg.from_user.username}) requested {msg.text}")
+    match = re.search(YOUTUBE_REGEX, msg.text)
+    if not match:
+        return
 
-    if match:
-        user_id = msg.from_user.id
+    user_id = msg.from_user.id
+    user_tasks.setdefault(user_id, [])
+    user_messages.setdefault(user_id, [])
 
-        # Initialize user's task list if not exists
-        if user_id not in user_tasks:
-            user_tasks[user_id] = []
-
-        if user_id not in user_messages:
-            user_messages[user_id] = []
-
-        original_url = match.group(0)
-        progress_msg = await msg.answer(
-            f"<blockquote>{original_url}</blockquote>\n🛜 подготовка к скачиванию...",
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-            parse_mode="HTML",
-        )
-        db_analytics.add_user(msg.from_user.id)
-        db_analytics.increment_use_count()
-
-        # Create animation task and track it
-        animation_task = asyncio.create_task(animate_starting_progress(progress_msg, original_url, bot))
-        user_tasks[user_id].append(animation_task)
-        user_messages[user_id].append(animation_task)
-
-        # Create the main download task
-        download_task = asyncio.create_task(
-            process_download(msg, bot, original_url, progress_msg, animation_task, user_id))
-        user_tasks[user_id].append(download_task)
-        user_messages[user_id].append(download_task)
-
-        # Set up cleanup when task completes
-        download_task.add_done_callback(
-            lambda t: user_tasks[user_id].remove(t) if user_id in user_tasks and t in user_tasks[user_id] else None
-        )
-
-
-async def process_download(msg, bot, original_url, progress_msg, animation_task, user_id):
-    """Process the download as a separate task that can be cancelled"""
-    # Use semaphore to limit concurrent downloads
-    async with download_semaphore:
-        # Define a temporary output template for yt-dlp to use video ID
-        # This simplifies cleanup and renaming later.
-        temp_ydl_opts = {
-            "format": "bestaudio/best",
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-            "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),  # Download using ID
-            "quiet": True,
-            "no_warnings": True,
-            "ignoreerrors": True,
-            "extract_flat": False,
-        }
-
-        # Track the temporary file paths created by yt-dlp
-        temp_audio_filepath = None
-
-        try:
-            # Extract info without downloading first
-            with YoutubeDL(temp_ydl_opts) as ydl:
-                try:
-                    info_dict = await run_in_threadpool(ydl.extract_info, original_url, download=False)
-                except Exception as e:
-                    print(f"Info extraction error (may be normal for cached content): {e}")
-                    # If info extraction fails completely, we can't proceed
-                    await progress_msg.edit_text(
-                        f"<blockquote>{original_url}</blockquote>\n❌ не удалось получить информацию о видео",
-                        link_preview_options=LinkPreviewOptions(is_disabled=True),
-                        parse_mode="HTML",
-                    )
-                    return
-
-            animation_task.cancel()
-
-            # Check if it's a playlist
-            if "_type" in info_dict and info_dict["_type"] == "playlist":
-                playlist_title = info_dict.get("title", "Unknown Playlist")
-
-                entries = info_dict.get("entries", [])
-                if not entries:
-                    await msg.answer("❌ ерор!!!\nПлейлист пуст или не удалось получить данные.")
-                    await progress_msg.delete()
-                    return
-
-                for i, entry in enumerate(entries):
-                    # Check if task was cancelled
-                    if asyncio.current_task().cancelled():
-                        raise asyncio.CancelledError()
-
-                    if entry is None:
-                        print(f"Skipping null entry in playlist {original_url}")
-                        continue
-
-                    video_url = entry.get("webpage_url")
-                    if not video_url:
-                        print(f"Could not get URL for entry {i + 1} in playlist {original_url}")
-                        continue
-
-                    video_id = entry.get("id")
-                    title = entry.get("title", "<unknown>")
-                    artist = entry.get("artist", entry.get("uploader", "<unknown>"))
-                    artist = _remove_duplicate_artists(artist)
-                    thumbnail_url = entry.get("thumbnail")
-
-                    # Check if file is cached
-                    cached_file_id = db.get_file_id(video_id)
-                    if cached_file_id:
-                        try:
-                            await progress_msg.delete()
-                        except:
-                            pass
-
-                        if await send_cached_audio(msg, bot, video_id, cached_file_id, progress_msg):
-                            continue  # Skip to next item if cached version sent successfully
-
-                    # Original temporary path used by yt-dlp
-                    temp_audio_filepath = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
-                    # Desired final path with title
-                    cleaned_title = sanitize_filename(title)
-                    final_audio_filepath = os.path.join(DOWNLOAD_DIR, f"{cleaned_title}.mp3")
-
-                    try:
-                        try:
-                            await progress_msg.delete()
-                        except:
-                            pass
-                        if animation_task and not animation_task.done():
-                            animation_task.cancel()
-
-                        progress_msg = await msg.answer(
-                            f"<blockquote>{original_url}</blockquote>\n⬇️ плейлист: скачивание...\n<i>({i + 1}/{len(entries)})</i> <b>{title}</b>",
-                            link_preview_options=LinkPreviewOptions(is_disabled=True),
-                            parse_mode="HTML", disable_notification=True,
-                        )
-                        user_messages[user_id].append(progress_msg)
-                        animation_task = asyncio.create_task(
-                            animate_progress(progress_msg, original_url, "⬇️ плейлист: скачивание",
-                                             f"\n<i>({i + 1}/{len(entries)})</i> <b>{title}</b>", bot,
-                                             ChatAction.RECORD_VIDEO))
-                        user_tasks[user_id].append(animation_task)
-
-                        # Check if task was cancelled
-                        if asyncio.current_task().cancelled():
-                            raise asyncio.CancelledError()
-
-                        # Download asynchronously
-                        # Use the temp_ydl_opts here, so it downloads to {video_id}.mp3
-                        await download_video(video_url, temp_ydl_opts)
-
-                        if os.path.exists(temp_audio_filepath) and thumbnail_url:
-                            # --- RENAME THE FILE HERE ---
-                            try:
-                                if os.path.exists(final_audio_filepath):
-                                    # Handle potential duplicates if two videos have the exact same sanitized title
-                                    # For simplicity, we'll append a number. You might want a more robust solution.
-                                    base, ext = os.path.splitext(final_audio_filepath)
-                                    count = 1
-                                    while os.path.exists(f"{base}_{count}{ext}"):
-                                        count += 1
-                                    final_audio_filepath = f"{base}_{count}{ext}"
-
-                                os.rename(temp_audio_filepath, final_audio_filepath)
-                                print(f"Renamed {temp_audio_filepath} to {final_audio_filepath}")
-                            except Exception as e:
-                                print(f"Error renaming file {temp_audio_filepath} to {final_audio_filepath}: {e}")
-                                # Proceed with the temp_audio_filepath if rename fails
-                                final_audio_filepath = temp_audio_filepath
-                            # --- END RENAME ---
-
-                            animation_task.cancel()
-                            await progress_msg.edit_text(
-                                f"<blockquote>{original_url}</blockquote>\n✴️ плейлист: обработка...\n<i>({i + 1}/{len(entries)})</i> <b>{title}</b>",
-                                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                                parse_mode="HTML",
-                            )
-                            animation_task = asyncio.create_task(
-                                animate_progress(progress_msg, original_url, "✴️ плейлист: обработка",
-                                                 f"\n<i>({i + 1}/{len(entries)})</i> <b>{title}</b>", bot,
-                                                 ChatAction.UPLOAD_PHOTO))
-                            user_tasks[user_id].append(animation_task)
-
-                            # Check if task was cancelled
-                            if asyncio.current_task().cancelled():
-                                raise asyncio.CancelledError()
-
-                            try:
-                                # Process audio asynchronously using the final_audio_filepath
-                                thumbnail_data = await process_audio(final_audio_filepath, title, artist, thumbnail_url)
-
-                                animation_task.cancel()
-                                await progress_msg.edit_text(
-                                    f"<blockquote>{original_url}</blockquote>\n❇️ плейлист: отправка...\n<i>({i + 1}/{len(entries)})</i> <b>{title}</b>",
-                                    link_preview_options=LinkPreviewOptions(is_disabled=True),
-                                    parse_mode="HTML",
-                                )
-                                animation_task = asyncio.create_task(
-                                    animate_progress(progress_msg, original_url, "❇️ плейлист: отправка",
-                                                     f"\n<i>({i + 1}/{len(entries)})</i> <b>{title}</b>", bot,
-                                                     ChatAction.UPLOAD_VOICE))
-                                user_tasks[user_id].append(animation_task)
-
-                                # Check if task was cancelled
-                                if asyncio.current_task().cancelled():
-                                    raise asyncio.CancelledError()
-
-                                sent_message = await bot.send_audio(
-                                    chat_id=msg.chat.id,
-                                    audio=FSInputFile(final_audio_filepath),  # Use the final audio filepath
-                                    title=title,
-                                    performer=artist,
-                                    thumbnail=BufferedInputFile(
-                                        thumbnail_data,
-                                        filename=f"{video_id}_thumb.jpg",
-                                    ),
-                                    disable_notification=True,
-                                )
-
-                                # Save file_id to database
-                                db.add_data(video_id, sent_message.audio.file_id)
-
-                            except Exception as e:
-                                animation_task.cancel()
-                                await msg.answer(
-                                    f"❌ ерор при обработке '{title}'!!!\n{e}"
-                                )
-                        else:
-                            animation_task.cancel()
-                            await msg.answer(
-                                f"❌ ерор!!!\n404 ВИДЕО '{title}' НЕТ ютуб момент"
-                            )
-
-                    except asyncio.CancelledError:
-                        # Handle cancellation
-                        print(f"Download cancelled for user {user_id}")
-                        if os.path.exists(temp_audio_filepath):
-                            os.remove(temp_audio_filepath)
-                        if os.path.exists(final_audio_filepath) and final_audio_filepath != temp_audio_filepath:
-                            os.remove(final_audio_filepath)
-                        raise  # Re-raise to exit the function
-
-                    except Exception as e:
-                        animation_task.cancel()
-                        error_msg = await msg.answer(f"❌ ерор при скачивании '{title}'!!!\n{e}")
-                        user_messages[user_id].append(error_msg)
-                        await asyncio.sleep(10)
-                        try:
-                            await error_msg.delete()
-                            user_messages[user_id].remove(error_msg)
-                        except Exception:
-                            pass
-                    finally:
-                        # Clean up both possible file paths
-                        if os.path.exists(temp_audio_filepath):
-                            os.remove(temp_audio_filepath)
-                            print(f"Cleaned up {temp_audio_filepath}")
-                        if os.path.exists(final_audio_filepath) and final_audio_filepath != temp_audio_filepath:
-                            os.remove(final_audio_filepath)
-                            print(f"Cleaned up {final_audio_filepath}")
-
-                # Delete the final progress message for the playlist after all items are sent
-                if animation_task and not animation_task.done():
-                    animation_task.cancel()
-                try:
-                    await progress_msg.delete()
-                except:
-                    pass
-                done_msg = await msg.answer("✅ готово, плейлист полностью скачан")
-                await asyncio.sleep(10)
-                await done_msg.delete()
-
-            # If it's a single video
-            else:
-                video_id = info_dict.get("id")
-                title = info_dict.get("title", "<unknown>")
-                artist = info_dict.get("artist", info_dict.get("uploader", "<unknown>"))
-                artist = _remove_duplicate_artists(artist)
-                thumbnail_url = info_dict.get("thumbnail")
-
-                # Check if file is cached
-                cached_file_id = db.get_file_id(video_id)
-                if cached_file_id:
-                    animation_task.cancel()
-                    if await send_cached_audio(msg, bot, video_id, cached_file_id, progress_msg):
-                        return  # Exit if cached version sent successfully
-
-                # Original temporary path used by yt-dlp
-                temp_audio_filepath = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
-                # Desired final path with title
-                cleaned_title = sanitize_filename(title)
-                final_audio_filepath = os.path.join(DOWNLOAD_DIR, f"{cleaned_title}.mp3")
-
-                await progress_msg.edit_text(
-                    f"<blockquote>{original_url}</blockquote>\n⬇️ скачивание...",
-                    link_preview_options=LinkPreviewOptions(is_disabled=True),
-                    parse_mode="HTML",
-                )
-                animation_task = asyncio.create_task(
-                    animate_progress(progress_msg, original_url, "⬇️ скачивание", "", bot, ChatAction.RECORD_VIDEO))
-                user_tasks[user_id].append(animation_task)
-
-                # Check if task was cancelled
-                if asyncio.current_task().cancelled():
-                    raise asyncio.CancelledError()
-
-                # Download asynchronously
-                # Use the temp_ydl_opts here, so it downloads to {video_id}.mp3
-                await download_video(original_url, temp_ydl_opts)
-
-                if os.path.exists(temp_audio_filepath) and thumbnail_url:
-                    # --- RENAME THE FILE HERE ---
-                    try:
-                        if os.path.exists(final_audio_filepath):
-                            base, ext = os.path.splitext(final_audio_filepath)
-                            count = 1
-                            while os.path.exists(f"{base}_{count}{ext}"):
-                                count += 1
-                            final_audio_filepath = f"{base}_{count}{ext}"
-
-                        os.rename(temp_audio_filepath, final_audio_filepath)
-                        print(f"Renamed {temp_audio_filepath} to {final_audio_filepath}")
-                    except Exception as e:
-                        print(f"Error renaming file {temp_audio_filepath} to {final_audio_filepath}: {e}")
-                        final_audio_filepath = temp_audio_filepath
-                    # --- END RENAME ---
-
-                    animation_task.cancel()
-                    await progress_msg.edit_text(
-                        f"<blockquote>{original_url}</blockquote>\n✴️ обработка...",
-                        link_preview_options=LinkPreviewOptions(is_disabled=True),
-                        parse_mode="HTML",
-                    )
-                    animation_task = asyncio.create_task(
-                        animate_progress(progress_msg, original_url, "✴️ обработка", "", bot, ChatAction.UPLOAD_PHOTO))
-                    user_tasks[user_id].append(animation_task)
-
-                    # Check if task was cancelled
-                    if asyncio.current_task().cancelled():
-                        raise asyncio.CancelledError()
-
-                    try:
-                        # Process audio asynchronously using the final_audio_filepath
-                        thumbnail_data = await process_audio(final_audio_filepath, title, artist, thumbnail_url)
-
-                        animation_task.cancel()
-                        await progress_msg.edit_text(
-                            f"<blockquote>{original_url}</blockquote>\n❇️ отправка...",
-                            link_preview_options=LinkPreviewOptions(is_disabled=True),
-                            parse_mode="HTML",
-                        )
-                        animation_task = asyncio.create_task(
-                            animate_progress(progress_msg, original_url, "❇️ отправка", "", bot,
-                                             ChatAction.UPLOAD_VOICE))
-                        user_tasks[user_id].append(animation_task)
-
-                        # Check if task was cancelled
-                        if asyncio.current_task().cancelled():
-                            raise asyncio.CancelledError()
-
-                        await bot.send_chat_action(
-                            chat_id=msg.chat.id, action=ChatAction.UPLOAD_VOICE
-                        )
-                        sent_message = await bot.send_audio(
-                            chat_id=msg.chat.id,
-                            audio=FSInputFile(final_audio_filepath),  # Use the final audio filepath
-                            title=title,
-                            performer=artist,
-                            thumbnail=BufferedInputFile(
-                                thumbnail_data,
-                                filename=f"{video_id}_thumb.jpg",
-                            ),
-                        )
-
-                        # Save file_id to database
-                        db.add_data(video_id, sent_message.audio.file_id)
-
-                        animation_task.cancel()
-                        await progress_msg.delete()
-
-                    except asyncio.CancelledError:
-                        # Handle cancellation
-                        print(f"Download cancelled for user {user_id}")
-                        if os.path.exists(temp_audio_filepath):
-                            os.remove(temp_audio_filepath)
-                        if os.path.exists(final_audio_filepath) and final_audio_filepath != temp_audio_filepath:
-                            os.remove(final_audio_filepath)
-                        raise  # Re-raise to exit the function
-
-                    except Exception as e:
-                        animation_task.cancel()
-                        error_msg = await msg.answer(f"❌ ерор!!!\n{e}")
-                        await asyncio.sleep(10)
-                        await progress_msg.delete()
-                        await error_msg.delete()
-                else:
-                    animation_task.cancel()
-                    error_msg = await msg.answer(f"❌ ерор!!! такого видео нет")
-                    await asyncio.sleep(10)
-                    await progress_msg.delete()
-                    await error_msg.delete()
-
-        except asyncio.CancelledError:
-            # Handle cancellation
-            print(f"Download cancelled for user {user_id}")
-            if animation_task and not animation_task.done():
-                animation_task.cancel()
-            await progress_msg.edit_text(
-                f"<blockquote>{original_url}</blockquote>\n❌ отменено",
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                parse_mode="HTML",
-            )
-            await asyncio.sleep(3)
-            await progress_msg.delete()
-
-        except Exception as e:
-            if animation_task and not animation_task.done():
-                animation_task.cancel()
-            error_msg = await msg.answer(f"❌ ерор!!!\n{e}")
-            await asyncio.sleep(10)
-            await progress_msg.delete()
-            await error_msg.delete()
-
-        finally:
-            # Ensure all temporary and final files are cleaned up
-            if temp_audio_filepath and os.path.exists(temp_audio_filepath):
-                os.remove(temp_audio_filepath)
-                print(f"Cleaned up {temp_audio_filepath}")
-            if final_audio_filepath and os.path.exists(
-                    final_audio_filepath) and final_audio_filepath != temp_audio_filepath:
-                os.remove(final_audio_filepath)
-                print(f"Cleaned up {final_audio_filepath}")
-            print(f"{msg.from_user.id} (@{msg.from_user.username})'s request is complete")
+    url = match.group(0)
+    task = asyncio.create_task(handle_url(msg, bot, url, user_id))
+    track_task(user_id, task)
+    task.add_done_callback(lambda t: untrack_task(user_id, t))
