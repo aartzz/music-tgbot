@@ -19,6 +19,7 @@ from modules.downloader import (
 from modules.processing import process_audio, cleanup_file
 from modules.utils import safe_edit_text, remove_duplicate_artists
 from modules.progress import animate_ellipsis, animate_download_progress, animate_countdown, animate_starting, format_download_text
+import html
 
 # ------------------------------------------------------------------------------
 # Router & Database
@@ -83,6 +84,20 @@ async def cancel_user_tasks_and_messages(uid: int):
 # ------------------------------------------------------------------------------
 # Core file sending
 # ------------------------------------------------------------------------------
+def extract_video_id(url: str) -> Optional[str]:
+    """Extract video ID from YouTube URL"""
+    patterns = [
+        r'(?:v=|/)([0-9A-Za-z_-]{11}).*',
+        r'(?:embed/)([0-9A-Za-z_-]{11})',
+        r'^([0-9A-Za-z_-]{11})$',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+
 async def send_cached_audio(msg: Message, bot: Bot, vid_id: str, file_id: str, progress_msg: Message) -> bool:
     try:
         await progress_msg.delete()
@@ -120,23 +135,42 @@ async def send_processed_audio(
 # Video processing pipeline
 # ------------------------------------------------------------------------------
 async def process_single_video(
-    msg: Message,
-    bot: Bot,
-    original_url: str,
-    info: Dict[str, Any],
-    progress_msg: Message,
-    user_id: int
+        msg: Message,
+        bot: Bot,
+        original_url: str,
+        info: Dict[str, Any],
+        progress_msg: Optional[Message],
+        user_id: int,
+        skip_db_check: bool = False  # For playlist entries already checked
 ):
     vid_id = info.get("id")
     title = info.get("title", "<unknown>")
     artist = remove_duplicate_artists(info.get("artist", info.get("uploader", "<unknown>")))
     thumb_url = info.get("thumbnail")
 
-    cached_id = db.get_file_id(vid_id)
-    if cached_id:
-        sent = await send_cached_audio(msg, bot, vid_id, cached_id, progress_msg)
-        if sent:
-            return
+    # Check cache first if not skipped
+    if not skip_db_check:
+        cached_id = db.get_file_id(vid_id)
+        if cached_id:
+            try:
+                await bot.send_audio(chat_id=msg.chat.id, audio=cached_id, disable_notification=True)
+                if progress_msg:
+                    try:
+                        await progress_msg.delete()
+                    except Exception:
+                        pass
+                return
+            except Exception:
+                db.remove_data(vid_id)
+
+    # Now create progress message if it doesn't exist
+    if not progress_msg:
+        progress_msg = await msg.answer(
+            f"<blockquote>{original_url}</blockquote>\n⬇️ скачивание...",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            parse_mode="HTML",
+        )
+        track_message(user_id, progress_msg)
 
     temp_path, final_path = build_paths(vid_id, title)
     download_progress[vid_id] = 0.0
@@ -148,7 +182,8 @@ async def process_single_video(
         parse_mode="HTML",
     )
 
-    anim_task = asyncio.create_task(animate_download_progress(progress_msg, original_url, vid_id, bot, download_progress))
+    anim_task = asyncio.create_task(
+        animate_download_progress(progress_msg, original_url, vid_id, bot, download_progress))
     track_task(user_id, anim_task)
 
     try:
@@ -169,7 +204,8 @@ async def process_single_video(
             link_preview_options=LinkPreviewOptions(is_disabled=True),
             parse_mode="HTML",
         )
-        anim_task = asyncio.create_task(animate_ellipsis(progress_msg, original_url, "✴️ обработка", "", bot, ChatAction.UPLOAD_PHOTO))
+        anim_task = asyncio.create_task(
+            animate_ellipsis(progress_msg, original_url, "✴️ обработка", "", bot, ChatAction.UPLOAD_PHOTO))
         track_task(user_id, anim_task)
 
         thumb_data = await process_audio(final_path, title, artist, thumb_url)
@@ -180,13 +216,9 @@ async def process_single_video(
             link_preview_options=LinkPreviewOptions(is_disabled=True),
             parse_mode="HTML",
         )
-        anim_task = asyncio.create_task(animate_ellipsis(progress_msg, original_url, "❇️ отправка", "", bot, ChatAction.UPLOAD_VOICE))
-        track_task(user_id, anim_task)
 
-        await bot.send_chat_action(chat_id=msg.chat.id, action=ChatAction.UPLOAD_VOICE)
         await send_processed_audio(bot, msg, vid_id, final_path, title, artist, thumb_data)
 
-        anim_task.cancel()
         try:
             await progress_msg.delete()
         except Exception:
@@ -200,41 +232,52 @@ async def process_single_video(
         cleanup_file(temp_path)
         cleanup_file(final_path)
         raise
-
     except Exception as e:
         try:
             anim_task.cancel()
         except Exception:
             pass
-        err_txt = f"⛔️ ошибка обработки\n{e}"
+        err_txt = "⛔️ ошибка обработки"
+        error_details = html.escape(str(e))
         try:
             await progress_msg.edit_text(
-                f"<blockquote>{original_url}</blockquote>\n{err_txt} <i>15</i>\n```\n{e}```",
+                f"<blockquote>{original_url}</blockquote>\n{err_txt} <i>15</i>\n<pre><code>{error_details}</code></pre>",
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                 parse_mode="HTML",
             )
         except Exception:
             progress_msg = await msg.answer(
-                f"<blockquote>{original_url}</blockquote>\n{err_txt} <i>15</i>\n```\n{e}```",
+                f"<blockquote>{original_url}</blockquote>\n{err_txt} <i>15</i>\n<pre><code>{error_details}</code></pre>",
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
                 parse_mode="HTML",
             )
             track_message(user_id, progress_msg)
-        await animate_countdown(progress_msg, err_txt, 15, original_url, str(e))
+        await animate_countdown(progress_msg, err_txt, 15, original_url, error_details)
     finally:
         download_progress.pop(vid_id, None)
         cleanup_file(temp_path)
         cleanup_file(final_path)
-        try:
-            anim_task.cancel()
-        except Exception:
-            pass
 
 # ------------------------------------------------------------------------------
 # Entry point for URLs
 # ------------------------------------------------------------------------------
 async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
     is_playlist = "list=" in original_url or "/playlist" in original_url
+
+    # For single videos, try DB check before ANY messages
+    if not is_playlist:
+        vid_id = extract_video_id(original_url)
+        if vid_id:
+            cached_id = db.get_file_id(vid_id)
+            if cached_id:
+                db_analytics.add_user(msg.from_user.id)
+                db_analytics.increment_use_count()
+                try:
+                    await bot.send_audio(chat_id=msg.chat.id, audio=cached_id, disable_notification=True)
+                    return
+                except Exception:
+                    db.remove_data(vid_id)
+
     progress_msg = await msg.answer(
         f"<blockquote>{original_url}</blockquote>\n🛜 достаю {'плейлист' if is_playlist else 'видео'}...",
         link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -259,7 +302,6 @@ async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
 
         start_anim.cancel()
 
-        # Playlist
         if info.get("_type") == "playlist":
             entries = info.get("entries", []) or []
             if not entries:
@@ -287,13 +329,24 @@ async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
                     parse_mode="HTML",
                 )
 
+                # Check DB before creating message
+                vid_id = entry.get("id")
+                cached_id = db.get_file_id(vid_id) if vid_id else None
+                if cached_id:
+                    try:
+                        await bot.send_audio(chat_id=msg.chat.id, audio=cached_id, disable_notification=True)
+                        continue
+                    except Exception:
+                        db.remove_data(vid_id)
+
                 video_msg = await msg.answer(
                     f"<blockquote>{entry['webpage_url']}</blockquote>\n⬇️ скачивание...",
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                     parse_mode="HTML",
                 )
                 track_message(user_id, video_msg)
-                await process_single_video(msg, bot, entry["webpage_url"], entry, video_msg, user_id)
+                await process_single_video(msg, bot, entry["webpage_url"], entry, video_msg, user_id,
+                                           skip_db_check=True)
 
             try:
                 await progress_msg.delete()

@@ -22,9 +22,6 @@ def format_download_text(percentage: float, animation: str) -> str:
 # ------------------------------------------------------------------------------
 # Countdown messages
 # ------------------------------------------------------------------------------
-# ------------------------------------------------------------------------------
-# Countdown messages
-# ------------------------------------------------------------------------------
 async def animate_countdown(
     message,
     info: str,
@@ -80,7 +77,6 @@ async def animate_ellipsis(progress_msg, original_url: str, prefix: str, suffix:
     count = 1
     while True:
         try:
-            await bot.send_chat_action(chat_id=progress_msg.chat.id, action=action)
             dots = animations[count % len(animations)]
             text = f"<blockquote>{original_url}</blockquote>\n{prefix}{dots}{suffix}"
             try:
@@ -91,7 +87,7 @@ async def animate_ellipsis(progress_msg, original_url: str, prefix: str, suffix:
                     parse_mode="HTML",
                 )
             except TelegramBadRequest as e:
-                if "too many requests" in str(e).lower() or "retry after" in str(e).lower():
+                if "too many requests" in str(e).lower() or "retry after" in str(e).lower() or "flood control" in str(e).lower():
                     pass
                 else:
                     raise
@@ -111,7 +107,6 @@ async def animate_starting(progress_msg, original_url: str, bot, is_playlist: bo
 
     while True:
         try:
-            await bot.send_chat_action(chat_id=progress_msg.chat.id, action=ChatAction.CHOOSE_STICKER)
             dots = animations[count % len(animations)]
             if count < 15:
                 text = f"<blockquote>{original_url}</blockquote>\n{search_text}{dots}"
@@ -121,12 +116,18 @@ async def animate_starting(progress_msg, original_url: str, bot, is_playlist: bo
                     f"<blockquote>{original_url}</blockquote>\n"
                     f"{wait_text} <i>(прошло {count}с | отменить /cancel)</i>"
                 )
-            await safe_edit_text(
-                progress_msg,
-                text,
-                link_preview_options=LinkPreviewOptions(is_disabled=True),
-                parse_mode="HTML",
-            )
+            try:
+                await safe_edit_text(
+                    progress_msg,
+                    text,
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                    parse_mode="HTML",
+                )
+            except TelegramBadRequest as e:
+                if "too many requests" in str(e).lower() or "retry after" in str(e).lower() or "flood control" in str(e).lower():
+                    pass
+                else:
+                    raise
             count += 1
             await asyncio.sleep(1)
         except Exception:
@@ -140,14 +141,12 @@ async def animate_download_progress(progress_msg, original_url: str, video_id: s
     animations = [".", "..", "..."]
     i = -1
     last_switch = 0.0
-    update_interval = 0.5 if not is_playlist else 1
+    update_interval = 0.5 if not is_playlist else 1.0
     ellipsis_interval = 1.0
     next_update = asyncio.get_event_loop().time()
 
     try:
         while True:
-            await bot.send_chat_action(chat_id=progress_msg.chat.id, action=ChatAction.RECORD_VIDEO)
-
             now = asyncio.get_event_loop().time()
             if now - last_switch >= ellipsis_interval:
                 i = (i + 1) % len(animations)
@@ -165,7 +164,7 @@ async def animate_download_progress(progress_msg, original_url: str, video_id: s
                     parse_mode="HTML",
                 )
             except TelegramBadRequest as e:
-                if "too many requests" in str(e).lower() or "retry after" in str(e).lower():
+                if "too many requests" in str(e).lower() or "retry after" in str(e).lower() or "flood control" in str(e).lower():
                     pass  # Let animation freeze, continue after
                 else:
                     raise
