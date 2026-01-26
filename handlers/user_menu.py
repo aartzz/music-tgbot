@@ -437,9 +437,10 @@ async def handle_url(msg: Message, bot: Bot, original_url: str, user_id: int):
 async def start(msg: Message):
     await msg.answer(
         """<b><u>lostya's youtube music downloader</u></b>
-этот бот сделан специально для @lostyawolfer но ты им тоже можешь пользоваться
+скачивает аудио с ютуба
 
-<b>РАБОТАЕТ ТОЛЬКО ЮТУБ!</b>
+нужно скачать видео?
+@lostyawolfer_video_bot :)
 
 <b><i>КАК ПОЛЬЗОВАТЬСЯ:</i></b>
 <blockquote>- скинь ссылку на видео или плейлист ютуб
@@ -447,8 +448,7 @@ async def start(msg: Message):
 - можно отправлять несколько ссылок
 - /cancel отменяет все загрузки
 - сообщения прогресса анимированы
-- бот автоматически очищает командные сообщения
-- используется кеш, повторные загрузки мгновенны!</blockquote>""",
+- повторные загрузки ранее загружавшихся видео мгновенны</blockquote>""",
         parse_mode="HTML",
     )
 

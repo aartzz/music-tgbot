@@ -5,6 +5,7 @@ from data.loader import *
 
 
 async def main():
+    bot, dp = await init_bot()
     dp.include_router(user_menu.router)
     await dp.start_polling(bot)
 
