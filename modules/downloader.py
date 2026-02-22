@@ -23,18 +23,6 @@ def create_progress_hook(video_id: str, progress_dict: dict):
 def make_ydl_opts(video_id=None, progress_dict=None) -> Dict[str, Any]:
     opts = {
         "format": "bestaudio",
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android_vr"]
-            }
-        },
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Linux; Android 12; Quest 2) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Mobile VR Safari/537.36"
-            )
-        },
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
