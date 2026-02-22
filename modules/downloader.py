@@ -22,9 +22,14 @@ def create_progress_hook(video_id: str, progress_dict: dict):
 
 def make_ydl_opts(video_id=None, progress_dict=None) -> Dict[str, Any]:
     opts = {
-        "format": "bestaudio/best",
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
-                            "preferredquality": "192"}],
+        "format": "bestaudio",
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "0",
+            }
+        ],
         "outtmpl": os.path.join("downloads", "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
