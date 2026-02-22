@@ -34,8 +34,6 @@ def make_ydl_opts(video_id=None, progress_dict=None) -> Dict[str, Any]:
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
-        "noplaylist": True,
-        "cachedir": False,
     }
     if video_id and progress_dict is not None:
         opts["progress_hooks"] = [create_progress_hook(video_id, progress_dict)]
