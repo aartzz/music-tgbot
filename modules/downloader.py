@@ -22,13 +22,32 @@ def create_progress_hook(video_id: str, progress_dict: dict):
 
 def make_ydl_opts(video_id=None, progress_dict=None) -> Dict[str, Any]:
     opts = {
-        "format": "bestaudio/best",
-        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3",
-                            "preferredquality": "192"}],
+        "format": "bestaudio",
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android_vr"]
+            }
+        },
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Linux; Android 12; Quest 2) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Mobile VR Safari/537.36"
+            )
+        },
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "0",
+            }
+        ],
         "outtmpl": os.path.join("downloads", "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
+        "noplaylist": True,
+        "cachedir": False,
     }
     if video_id and progress_dict is not None:
         opts["progress_hooks"] = [create_progress_hook(video_id, progress_dict)]
