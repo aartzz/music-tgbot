@@ -3,6 +3,8 @@ import asyncio
 import logging
 from yt_dlp import YoutubeDL
 from typing import Any, Dict, Optional
+
+from data.config import env_bool, env_int, configfile
 from .utils import run_in_threadpool, sanitize_filename
 
 yt_dlp_logger = logging.getLogger("yt_dlp")
@@ -21,7 +23,20 @@ def create_progress_hook(video_id: str, progress_dict: dict):
 
 
 def make_ydl_opts(video_id=None, progress_dict=None) -> Dict[str, Any]:
-    opts = {
+    """
+    Default downloader options.
+
+    If COOKIES_ENABLED=true, this enables the setup that usually works for YouTube Music Premium:
+      - cookies from COOKIES_PATH
+      - JS runtime node (yt-dlp's EJS flow)
+      - allow remote component download for EJS from GitHub
+      - bgutil POT provider is picked up automatically if the plugin is installed and the service runs
+        on http://127.0.0.1:4416 (default).
+    """
+    cookies_enabled = env_bool("COOKIES_ENABLED", False)
+    cookies_path = str(configfile.get("COOKIES_PATH", "") or "").strip()
+
+    opts: Dict[str, Any] = {
         "format": "bestaudio",
         "postprocessors": [
             {
@@ -35,6 +50,17 @@ def make_ydl_opts(video_id=None, progress_dict=None) -> Dict[str, Any]:
         "no_warnings": True,
         "ignoreerrors": True,
     }
+
+    if cookies_enabled:
+        if cookies_path:
+            # yt-dlp option name used by CLI --cookies
+            opts["cookiefile"] = cookies_path
+
+        # Equivalent to: --js-runtimes node --remote-components ejs:github
+        # (We explicitly set node to match the user's setup.)
+        opts["js_runtimes"] = {"node": {}}
+        opts["remote_components"] = {"ejs:github"}
+
     if video_id and progress_dict is not None:
         opts["progress_hooks"] = [create_progress_hook(video_id, progress_dict)]
     return opts
