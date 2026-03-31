@@ -18,15 +18,15 @@ def process_cover_and_tags(audio_path: str, title: str, artist: str, thumb: byte
     if img.mode == "RGBA":
         img = img.convert("RGB")
 
-    # Center crop to square
-    w, h = img.size
-    m = min(w, h)
-    img = img.crop(((w - m)//2, (h - m)//2, (w + m)//2, (h + m)//2))
-
-    # Smaller centered crop (346/461)
-    new_dim = int(m * (346 / 461))
-    offset = (m - new_dim)//2
-    img = img.crop((offset, offset, offset + new_dim, offset + new_dim))
+    # # Center crop to square
+    # w, h = img.size
+    # m = min(w, h)
+    # img = img.crop(((w - m)//2, (h - m)//2, (w + m)//2, (h + m)//2))
+    #
+    # # Smaller centered crop (346/461)
+    # new_dim = int(m * (346 / 461))
+    # offset = (m - new_dim)//2
+    # img = img.crop((offset, offset, offset + new_dim, offset + new_dim))
 
     # Save to bytes
     buf = BytesIO()
