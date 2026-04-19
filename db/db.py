@@ -1,6 +1,20 @@
 import os
 import sqlite3
 import datetime
+import asyncio
+import logging
+
+log = logging.getLogger(__name__)
+
+# Per-cache-key asyncio.Lock to prevent concurrent same-track downloads.
+_cache_locks: dict[str, asyncio.Lock] = {}
+
+
+def get_cache_lock(key: str) -> asyncio.Lock:
+    """Return a singleton Lock for the given cache key."""
+    if key not in _cache_locks:
+        _cache_locks[key] = asyncio.Lock()
+    return _cache_locks[key]
 
 
 class Music:
@@ -30,10 +44,29 @@ class Music:
         con.commit()
 
     def get_file_id(self, video_id):
+        """Look up a cached file_id by video_id.
+
+        Supports legacy YouTube entries stored as raw 11-char IDs:
+        if the prefixed key (e.g. 'youtube:dQw4w9WgXcQ') yields nothing
+        and the key starts with 'youtube:', also try the raw tail.
+        """
         con = sqlite3.connect(os.path.join('db','music.db'))
         cur = con.cursor()
         value = cur.execute('SELECT file_id FROM music WHERE video_id=?', (video_id,)).fetchone()
-        return value[0] if value else None
+        if value:
+            return value[0]
+
+        # Legacy fallback: raw YouTube ID stored without prefix.
+        if video_id.startswith("youtube:"):
+            raw_id = video_id[len("youtube:"):]
+            # Only attempt for 11-char YouTube-like IDs.
+            if len(raw_id) == 11 and raw_id.isascii():
+                value = cur.execute('SELECT file_id FROM music WHERE video_id=?', (raw_id,)).fetchone()
+                if value:
+                    log.info("legacy cache hit: %s → %s", video_id, raw_id)
+                    return value[0]
+
+        return None
 
 class Analytics:
     def createdb(self):
