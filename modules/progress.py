@@ -3,11 +3,12 @@ from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import LinkPreviewOptions
 from modules.utils import safe_edit_text
+from modules.i18n import t
 
 
-def format_download_text(percentage: float, animation: str) -> str:
+def format_download_text(percentage: float, animation: str, download_word: str = "скачивание") -> str:
     """Format download text with underlined progress"""
-    word = "скачивание"
+    word = download_word
     underline_len = int((percentage / 100.0) * len(word))
 
     if underline_len == 0:
@@ -92,11 +93,12 @@ async def animate_ellipsis(progress_msg, display_name: str, prefix: str, suffix:
             break
 
 
-async def animate_starting(progress_msg, original_url: str, bot, is_playlist: bool = False):
+async def animate_starting(progress_msg, original_url: str, bot, user_id: int = 0, is_playlist: bool = False):
     """Display 'fetching video/playlist' animation."""
     animations = [".", "..", "..."]
     count = 0
-    search_text = "🛜 достаю плейлист" if is_playlist else "🛜 достаю видео"
+    fetch_key = "fetching_playlist" if is_playlist else "fetching_video"
+    search_text = f"🛜 {t(user_id, fetch_key)}"
 
     while True:
         try:
@@ -104,10 +106,10 @@ async def animate_starting(progress_msg, original_url: str, bot, is_playlist: bo
             if count < 15:
                 text = f"<blockquote>{original_url}</blockquote>\n{search_text}{dots}"
             else:
-                wait_text = "⏳ больше видео = дольше обработка" if is_playlist else "⏳ терпение..."
+                wait_text = f"⏳ {t(user_id, 'more_videos_wait')}" if is_playlist else f"⏳ {t(user_id, 'patience')}"
                 text = (
                     f"<blockquote>{original_url}</blockquote>\n"
-                    f"{wait_text} <i>(прошло {count}с | отменить /cancel)</i>"
+                    f"{wait_text} <i>({t(user_id, 'elapsed_cancel', count)})</i>"
                 )
             try:
                 await safe_edit_text(
@@ -127,7 +129,7 @@ async def animate_starting(progress_msg, original_url: str, bot, is_playlist: bo
             break
 
 
-async def animate_download_progress(progress_msg, display_name: str, video_id: str, bot, download_progress: dict, is_playlist: bool = False):
+async def animate_download_progress(progress_msg, display_name: str, video_id: str, bot, download_progress: dict, user_id: int = 0, is_playlist: bool = False):
     """Continuously update download progress with animation."""
     animations = [".", "..", "..."]
     i = -1
@@ -135,6 +137,7 @@ async def animate_download_progress(progress_msg, display_name: str, video_id: s
     update_interval = 0.5 if not is_playlist else 0.5
     ellipsis_interval = 1.0
     next_update = asyncio.get_event_loop().time()
+    download_word = t(user_id, "downloading")
 
     try:
         while True:
@@ -144,7 +147,7 @@ async def animate_download_progress(progress_msg, display_name: str, video_id: s
                 last_switch = now
 
             percentage = download_progress.get(video_id, 0.0)
-            text = f"{display_name}\n{format_download_text(percentage, animations[i])}"
+            text = f"{display_name}\n{format_download_text(percentage, animations[i], download_word)}"
 
             try:
                 await safe_edit_text(
